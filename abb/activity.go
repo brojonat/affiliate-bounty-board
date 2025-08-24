@@ -72,7 +72,6 @@ const (
 	EnvLLMImageAPIKey                          = "LLM_IMAGE_API_KEY"
 	EnvLLMImageModel                           = "LLM_IMAGE_MODEL"
 	EnvLLMCheckContentRequirementsPromptBase   = "LLM_PROMPT_CHECK_CONTENT_REQUIREMENTS_BASE_B64"
-	EnvLLMValidatePayoutWalletPromptBase       = "LLM_PROMPT_VALIDATE_PAYOUT_WALLET_BASE_B64"
 	EnvLLMShouldPerformImageAnalysisPromptBase = "LLM_PROMPT_SHOULD_PERFORM_IMAGE_ANALYSIS_BASE_B64"
 	EnvLLMImageAnalysisPromptBase              = "LLM_PROMPT_IMAGE_ANALYSIS_BASE_B64"
 	EnvLLMMaliciousContentPromptBase           = "LLM_PROMPT_MALICIOUS_CONTENT_BASE_B64"
@@ -171,7 +170,6 @@ type Configuration struct {
 	SteamDeps                        SteamDependencies           `json:"steam_deps"`
 	DiscordConfig                    DiscordConfig               `json:"discord_config"`
 	CheckContentRequirementsPrompt   string                      `json:"check_content_requirements_prompt"`
-	ValidatePayoutWalletPrompt       string                      `json:"validate_payout_wallet_prompt"`
 	ShouldPerformImageAnalysisPrompt string                      `json:"should_perform_image_analysis_prompt"`
 	MaliciousContentPrompt           string                      `json:"malicious_content_prompt"`
 	OrchestratorPrompt               string                      `json:"orchestrator_prompt"`
@@ -196,30 +194,31 @@ func NewActivities() (*Activities, error) {
 	}, nil
 }
 
-// GenerateResponse is an activity that wraps the LLM provider's GenerateResponse method.
-func (a *Activities) GenerateResponse(ctx context.Context, messages []Message, tools []Tool) (*LLMResponse, error) {
+// ResponsesTurnResult is the result of a single Responses API turn
+type ResponsesTurnResult struct {
+	Assistant string
+	Calls     []ToolCall
+	ID        string
+}
+
+// GenerateResponsesTurn runs a single Responses API turn via the configured provider
+func (a *Activities) GenerateResponsesTurn(ctx context.Context, previousResponseID string, userInput string, tools []Tool, functionOutputs map[string]string) (ResponsesTurnResult, error) {
 	logger := activity.GetLogger(ctx)
 	cfg, err := getConfiguration(ctx)
 	if err != nil {
-		logger.Error("Failed to get configuration in GenerateResponse activity", "error", err)
-		return nil, fmt.Errorf("failed to get configuration: %w", err)
+		logger.Error("Failed to get configuration in GenerateResponsesTurn activity", "error", err)
+		return ResponsesTurnResult{}, fmt.Errorf("failed to get configuration: %w", err)
 	}
-
-	llmProvider, err := NewLLMProvider(cfg.LLMConfig)
+	provider, err := NewLLMProvider(cfg.LLMConfig)
 	if err != nil {
-		logger.Error("Failed to create LLM provider in GenerateResponse activity", "error", err)
-		return nil, fmt.Errorf("failed to create LLM provider: %w", err)
+		logger.Error("Failed to create LLM provider in GenerateResponsesTurn activity", "error", err)
+		return ResponsesTurnResult{}, fmt.Errorf("failed to create LLM provider: %w", err)
 	}
-
-	logger.Info("Calling LLM provider", "message_count", len(messages), "tool_count", len(tools))
-
-	resp, err := llmProvider.GenerateResponse(ctx, messages, tools)
+	assistant, calls, id, err := provider.GenerateResponsesTurn(ctx, previousResponseID, userInput, tools, functionOutputs)
 	if err != nil {
-		logger.Error("LLM provider call failed in GenerateResponse activity", "error", err)
-		return nil, fmt.Errorf("llmprovider.GenerateResponse failed: %w", err)
+		return ResponsesTurnResult{}, err
 	}
-
-	return resp, nil
+	return ResponsesTurnResult{Assistant: assistant, Calls: calls, ID: id}, nil
 }
 
 // getConfiguration reads configuration from environment variables.
@@ -325,10 +324,6 @@ func getConfiguration(ctx context.Context) (*Configuration, error) {
 	llmCheckContentRequirementsPromptBase, err := decodeBase64(os.Getenv(EnvLLMCheckContentRequirementsPromptBase))
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode LLM_PROMPT_CHECK_CONTENT_REQUIREMENTS_BASE_B64: %w", err)
-	}
-	llmValidatePayoutWalletPromptBase, err := decodeBase64(os.Getenv(EnvLLMValidatePayoutWalletPromptBase))
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode LLM_PROMPT_VALIDATE_PAYOUT_WALLET_BASE_B64: %w", err)
 	}
 	llmImageAnalysisPromptBase, err := decodeBase64(os.Getenv(EnvLLMImageAnalysisPromptBase))
 	if err != nil {
@@ -469,7 +464,6 @@ func getConfiguration(ctx context.Context) (*Configuration, error) {
 		SteamDeps:                        steamDeps,
 		DiscordConfig:                    discordConfig,
 		CheckContentRequirementsPrompt:   llmCheckContentRequirementsPromptBase,
-		ValidatePayoutWalletPrompt:       llmValidatePayoutWalletPromptBase,
 		ShouldPerformImageAnalysisPrompt: llmShouldPerformImageAnalysisPromptBase,
 		MaliciousContentPrompt:           llmMaliciousContentPromptBase,
 		OrchestratorPrompt:               llmOrchestratorPromptBase,
@@ -507,7 +501,7 @@ type PullContentInput struct {
 func (a *Activities) PullContentActivity(ctx context.Context, input PullContentInput) ([]byte, error) {
 	// Implementation to be added in subsequent steps
 	logger := activity.GetLogger(ctx)
-	logger.Info("PullContentActivity executing", "platform", input.PlatformType, "contentID", input.ContentID)
+	logger.Debug("PullContentActivity executing", "platform", input.PlatformType, "contentID", input.ContentID)
 
 	cfg, err := getConfiguration(ctx)
 	if err != nil {
@@ -1093,6 +1087,7 @@ type DeleteBountyEmbeddingViaHTTPActivityInput struct {
 // DeleteBountyEmbeddingViaHTTPActivity calls the server's HTTP endpoint to delete an embedding.
 func (a *Activities) DeleteBountyEmbeddingViaHTTPActivity(ctx context.Context, input DeleteBountyEmbeddingViaHTTPActivityInput) error {
 	logger := activity.GetLogger(ctx)
+	logger.Debug("DeleteBountyEmbeddingViaHTTPActivity started", "BountyID", input.BountyID)
 
 	if input.BountyID == "" {
 		logger.Error("DeleteBountyEmbeddingViaHTTPActivity called with empty BountyID")
@@ -1154,7 +1149,7 @@ type MarkGumroadSaleNotifiedActivityInput struct {
 // to mark a Gumroad sale as notified and record the API key sent to the user.
 func (a *Activities) MarkGumroadSaleNotifiedActivity(ctx context.Context, input MarkGumroadSaleNotifiedActivityInput) error {
 	logger := activity.GetLogger(ctx)
-	logger.Info("MarkGumroadSaleNotifiedActivity started", "SaleID", input.SaleID)
+	logger.Debug("MarkGumroadSaleNotifiedActivity started", "SaleID", input.SaleID)
 
 	cfg, err := getConfiguration(ctx) // Get full config to access AbbServerConfig
 	if err != nil {
@@ -1233,7 +1228,7 @@ func (a *Activities) CallGumroadNotifyActivity(ctx context.Context, input CallGu
 	logger := activity.GetLogger(ctx)
 
 	if cfg.Environment != "prod" {
-		logger.Info("Skipping Gumroad notification activity in non-prod environment", "env", cfg.Environment)
+		logger.Debug("Skipping Gumroad notification activity in non-prod environment", "env", cfg.Environment)
 		return nil
 	}
 
